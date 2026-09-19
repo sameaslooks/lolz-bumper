@@ -21,7 +21,7 @@ load_dotenv()
 def get_config() -> dict:
     def req(key: str) -> str:
         val = os.getenv(key)
-        if val is None:
+        if val is None or val == '':
             raise RuntimeError(f'Не задана переменная окружения: {key}')
         return val
 
@@ -31,6 +31,17 @@ def get_config() -> dict:
     thread_urls_raw = req('THREAD_URLS')
     thread_urls = [u.strip() for u in thread_urls_raw.split(',') if u.strip()]
 
+    owner_id_raw = req('TG_OWNER_ID')
+    try:
+        owner_id = int(owner_id_raw)
+    except ValueError:
+        raise RuntimeError(f'TG_OWNER_ID должен быть числом, получено: {owner_id_raw!r}')
+
+    if owner_id <= 0:
+        raise RuntimeError(f'TG_OWNER_ID должен быть положительным, получено: {owner_id}')
+
+    token = req('TG_TOKEN')
+
     return {
         'cookies': {
             'xf_user': req('XF_USER'),
@@ -39,13 +50,13 @@ def get_config() -> dict:
             'xf_csrf': opt('XF_CSRF', ''),
         },
         'bot_settings': {
-            'token': opt('TG_TOKEN', ''),
-            'owner_id': int(opt('TG_OWNER_ID', '0') or 0),
+            'token': token,
+            'owner_id': owner_id,
             'logs': int(opt('LOGS', '0')),
         },
         'settings': {
             'timeout': int(req('TIMEOUT')),
-            'jitter_seconds': int(opt('JITTER_SECONDS', '3600')),
+            'jitter_seconds': int(opt('JITTER_SECONDS', '1800')),
             'thread_timeout': int(opt('THREAD_TIMEOUT', '60')),
             'thread_urls': thread_urls,
         },
@@ -245,9 +256,6 @@ SPLIT_LETTERS_PATTERN = re.compile(r'^(?:\S;\s*)+\S?$')
 
 
 def normalize_error(msg: str) -> str:
-    """
-    Если форум вернул 'Y; o; u;  ; m; u; s; t...' — собираем обратно.
-    """
     stripped = msg.strip()
     if not stripped:
         return msg
@@ -281,7 +289,14 @@ def tg_api(config: dict, method: str, payload: dict) -> dict | None:
         return None
 
 
+def is_owner(config: dict, chat_id: int) -> bool:
+    """Проверка, что chat_id — это владелец бота."""
+    owner_id = config['bot_settings'].get('owner_id')
+    return bool(owner_id) and chat_id == owner_id
+
+
 def send_telegram(config: dict, text: str):
+    """Отправка владельцу (только ему)."""
     owner_id = config['bot_settings'].get('owner_id')
     if not owner_id:
         return
@@ -297,8 +312,11 @@ def send_telegram(config: dict, text: str):
 
 
 def send_telegram_to(config: dict, chat_id: int, text: str):
-    if not chat_id:
+    """Отправка в конкретный чат — только если это владелец."""
+    if not is_owner(config, chat_id):
+        print(f'[!] send_telegram_to: chat_id={chat_id} не владелец, игнорирую', flush=True)
         return
+
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     tg_api(config, 'sendMessage', {
         'chat_id': chat_id,
@@ -452,6 +470,10 @@ HELP_TEXT = (
 
 
 def handle_status(config: dict, chat_id: int):
+    if not is_owner(config, chat_id):
+        print(f'[!] handle_status: chat_id={chat_id} не владелец', flush=True)
+        return
+
     with STATE_LOCK:
         threads = dict(STATE['threads'])
         last_bump = STATE['last_bump']
@@ -491,6 +513,9 @@ def handle_status(config: dict, chat_id: int):
 
 
 def handle_help(config: dict, chat_id: int):
+    if not is_owner(config, chat_id):
+        print(f'[!] handle_help: chat_id={chat_id} не владелец', flush=True)
+        return
     send_telegram_to(config, chat_id, HELP_TEXT)
 
 
@@ -500,7 +525,9 @@ def handle_help(config: dict, chat_id: int):
 
 def telegram_polling(config: dict):
     token = config['bot_settings'].get('token')
-    if not token:
+    owner_id = config['bot_settings'].get('owner_id')
+    if not token or not owner_id:
+        print('[!] Polling отключён: нет token или owner_id', flush=True)
         return
 
     offset = None
@@ -538,7 +565,15 @@ def telegram_polling(config: dict):
                 msg = update.get('message')
                 if not msg:
                     continue
+
                 chat_id = msg['chat']['id']
+
+                # 🔒 ГЛАВНАЯ ПРОВЕРКА: игнорируем всех, кроме владельца
+                if chat_id != owner_id:
+                    print(f'[!] Игнорирую сообщение от chat_id={chat_id} '
+                          f'(username={msg["chat"].get("username")})', flush=True)
+                    continue
+
                 text = (msg.get('text') or '').strip()
 
                 if text in ('/start', '/help'):
