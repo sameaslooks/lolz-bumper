@@ -1,0 +1,13 @@
+services:
+  lolz-bumper:
+    build: .
+    container_name: lolz-bumper
+    restart: unless-stopped
+    volumes:
+      - ./main.py:/app/main.py:ro
+      - ./.env:/app/.env:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

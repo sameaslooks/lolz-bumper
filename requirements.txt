@@ -1,0 +1,4 @@
+curl_cffi
+pycryptodome
+requests
+python-dotenv
