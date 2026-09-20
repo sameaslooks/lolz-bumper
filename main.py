@@ -14,19 +14,29 @@ from dotenv import load_dotenv
 # =========================
 # КОНФИГ ИЗ .env
 # =========================
+# ВАЖНО: XF_USER должен быть URL-encoded (запятая между userId и ключом
+# должна быть заменена на %2C). Иначе XenForo убивает куку (Set-Cookie: xf_user=deleted).
 
 load_dotenv()
 
 
+def _env_str(key: str, default=None):
+    """Возвращает значение без кавычек и пробелов."""
+    val = os.getenv(key, default)
+    if val is None:
+        return None
+    return val.strip().strip('"').strip("'")
+
+
 def get_config() -> dict:
     def req(key: str) -> str:
-        val = os.getenv(key)
+        val = _env_str(key)
         if val is None or val == '':
             raise RuntimeError(f'Не задана переменная окружения: {key}')
         return val
 
     def opt(key: str, default=None):
-        return os.getenv(key, default)
+        return _env_str(key, default)
 
     thread_urls_raw = req('THREAD_URLS')
     thread_urls = [u.strip() for u in thread_urls_raw.split(',') if u.strip()]
@@ -46,13 +56,13 @@ def get_config() -> dict:
         'cookies': {
             'xf_user': req('XF_USER'),
             'xf_tfa_trust': req('XF_TFA_TRUST'),
-            'xf_session': opt('XF_SESSION', ''),
             'xf_csrf': opt('XF_CSRF', ''),
+            # xf_session НЕ читаем — её выдаёт сервер в Set-Cookie
         },
         'bot_settings': {
             'token': token,
             'owner_id': owner_id,
-            'logs': int(opt('LOGS', '0')),
+            'logs': int(opt('LOGS', '0') or '0'),
         },
         'settings': {
             'timeout': int(req('TIMEOUT')),
@@ -68,21 +78,84 @@ def get_config() -> dict:
 # =========================
 
 STATE = {
-    'threads': {},          # thread_id -> {'title': str, 'url': str}
-    'last_bump': None,      # datetime UTC
-    'next_cycle': None,     # datetime UTC
+    'threads': {},
+    'last_bump': None,
+    'next_cycle': None,
     'cookies_ok': True,
     'started_at': None,
-    'stopped': False,       # True = цикл остановлен (куки протухли)
+    'stopped': False,
+    'recheck_pending': False,
 }
 
 STATE_LOCK = threading.Lock()
+WAKE_EVENT = threading.Event()
 
 
 def wait_forever():
-    """Бесконечный сон — не даёт процессу завершиться, контейнер остаётся жив."""
     while True:
         time.sleep(3600)
+
+
+def wait_for_recheck():
+    while True:
+        with STATE_LOCK:
+            if not STATE['stopped']:
+                return
+        WAKE_EVENT.wait(timeout=5)
+        WAKE_EVENT.clear()
+
+
+def interruptible_sleep(seconds: float) -> bool:
+    woken = WAKE_EVENT.wait(timeout=seconds)
+    WAKE_EVENT.clear()
+    return woken
+
+
+# =========================
+# ДИАГНОСТИКА КУК
+# =========================
+
+def dump_set_cookie(r, config: dict, tag: str):
+    """Печатает все Set-Cookie из ответа (даже те, что curl_cffi не сохранил)."""
+    headers = getattr(r, 'headers', None)
+    if headers is None:
+        log(config, f'[{tag}] Set-Cookie: (нет headers)', level=2)
+        return
+
+    values = []
+    try:
+        got = headers.get_list('set-cookie')
+        if got:
+            values = list(got)
+    except Exception:
+        pass
+
+    if not values:
+        try:
+            single = headers.get('set-cookie')
+            if single:
+                values = [single]
+        except Exception:
+            pass
+
+    if not values:
+        log(config, f'[{tag}] Set-Cookie: (нет)', level=2)
+        return
+
+    for v in values:
+        log(config, f'[{tag}] Set-Cookie: {v}', level=2)
+
+
+def dump_session_cookies(session: curl_requests.Session, config: dict, tag: str):
+    """Диагностика: какие куки реально лежат в jar."""
+    try:
+        names = sorted({c.name for c in session.cookies.jar})
+    except Exception:
+        try:
+            names = sorted({c.name for c in session.cookies})
+        except Exception:
+            names = ['<unavailable>']
+    log(config, f'[{tag}] cookies: {names}', level=2)
 
 
 # =========================
@@ -121,10 +194,13 @@ def refresh_x(session: curl_requests.Session, config: dict) -> bool:
         log(config, f'[!] Не удалось загрузить главную: {e}', level=2)
         return False
 
+    dump_set_cookie(r, config, 'refresh_x')
+    log(config, f'[refresh_x] status={r.status_code} len={len(r.text)}', level=2)
+
     args = extract_main_args(r.text)
     if not args:
-        log(config, '[!] Не найдены аргументы main(...) в HTML', level=2)
-        return False
+        log(config, '[*] main(...) не найден — вероятно __x уже валиден', level=2)
+        return True
 
     data_hex, key_hex, iv_hex = args
     try:
@@ -136,6 +212,20 @@ def refresh_x(session: curl_requests.Session, config: dict) -> bool:
     session.cookies.set('__x', x_value, domain='lolz.team')
     log(config, f'[*] __x обновлён: {x_value[:16]}...', level=2)
     return True
+
+
+def warm_up(session: curl_requests.Session, config: dict):
+    """
+    После получения __x делаем один запрос, чтобы сервер выдал xf_session
+    и отдал HTML авторизованного пользователя.
+    """
+    try:
+        r = session.get('https://lolz.team/', impersonate='firefox', timeout=30)
+        dump_set_cookie(r, config, 'warm_up')
+        log(config, f'[warm_up] status={r.status_code} len={len(r.text)}', level=2)
+    except Exception as e:
+        log(config, f'[!] warm_up: {e}', level=2)
+    dump_session_cookies(session, config, 'warm_up')
 
 
 # =========================
@@ -154,6 +244,14 @@ def get_xf_token(session: curl_requests.Session, config: dict) -> str | None:
         )
     except Exception as e:
         log(config, f'[!] Не удалось получить _xfToken: {e}', level=2)
+        return None
+
+    dump_set_cookie(r, config, 'xf_token')
+    log(config, f'[xf_token] status={r.status_code} len={len(r.text)}', level=2)
+    dump_session_cookies(session, config, 'xf_token')
+
+    if r.status_code != 200:
+        log(config, f'[!] _xfToken: статус {r.status_code}', level=2)
         return None
 
     match = XF_TOKEN_PATTERN.search(r.text)
@@ -180,12 +278,27 @@ TITLE_TAG_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+BAD_TITLES = {
+    'error',
+    'lolz',
+    'just a moment...',
+    '502 bad gateway',
+    '503 service unavailable',
+    '504 gateway time-out',
+    'attention required!',
+    'checking your browser...',
+}
+
 
 def _clean_title(raw: str) -> str:
     raw = re.sub(r'<[^>]+>', '', raw)
     raw = re.sub(r'\s+', ' ', raw).strip()
     raw = re.sub(r'\s*[|—\-]\s*Lolz.*$', '', raw, flags=re.IGNORECASE).strip()
     return raw
+
+
+def _is_bad_title(title: str) -> bool:
+    return (not title) or (title.lower() in BAD_TITLES)
 
 
 def fetch_thread_title(session: curl_requests.Session, config: dict,
@@ -196,30 +309,24 @@ def fetch_thread_title(session: curl_requests.Session, config: dict,
     except Exception:
         return f'Тема {thread_id}'
 
+    dump_set_cookie(r, config, f'title:{thread_id}')
+    log(config, f'[title:{thread_id}] status={r.status_code} len={len(r.text)}', level=2)
+
     if is_challenge(r.text):
         refresh_x(session, config)
+        warm_up(session, config)
         try:
             r = session.get(url, impersonate='firefox', timeout=30)
+            dump_set_cookie(r, config, f'title:{thread_id}:retry')
         except Exception:
             return f'Тема {thread_id}'
 
-    match = H1_TITLE_PATTERN.search(r.text)
-    if match:
-        title = _clean_title(match.group(1))
-        if title:
-            return title
-
-    match = H1_TITLE_FALLBACK.search(r.text)
-    if match:
-        title = _clean_title(match.group(1))
-        if title:
-            return title
-
-    match = TITLE_TAG_PATTERN.search(r.text)
-    if match:
-        title = _clean_title(match.group(1))
-        if title:
-            return title
+    for pattern in (H1_TITLE_PATTERN, H1_TITLE_FALLBACK, TITLE_TAG_PATTERN):
+        m = pattern.search(r.text)
+        if m:
+            title = _clean_title(m.group(1))
+            if not _is_bad_title(title):
+                return title
 
     return f'Тема {thread_id}'
 
@@ -290,13 +397,11 @@ def tg_api(config: dict, method: str, payload: dict) -> dict | None:
 
 
 def is_owner(config: dict, chat_id: int) -> bool:
-    """Проверка, что chat_id — это владелец бота."""
     owner_id = config['bot_settings'].get('owner_id')
     return bool(owner_id) and chat_id == owner_id
 
 
 def send_telegram(config: dict, text: str):
-    """Отправка владельцу (только ему)."""
     owner_id = config['bot_settings'].get('owner_id')
     if not owner_id:
         return
@@ -312,7 +417,6 @@ def send_telegram(config: dict, text: str):
 
 
 def send_telegram_to(config: dict, chat_id: int, text: str):
-    """Отправка в конкретный чат — только если это владелец."""
     if not is_owner(config, chat_id):
         print(f'[!] send_telegram_to: chat_id={chat_id} не владелец, игнорирую', flush=True)
         return
@@ -327,11 +431,6 @@ def send_telegram_to(config: dict, chat_id: int, text: str):
 
 
 def log(config: dict, text: str, level: int = 2):
-    """
-    level: 0 — ничего
-           1 — успех + ошибки bump (без шума)
-           2 — всё (успех + ошибки + диагностика)
-    """
     console_text = re.sub(r'</?(?:b|i|code|u|s|pre)>', '', text)
     console_text = re.sub(r'</?a[^>]*>', '', console_text)
     console_text = re.sub(r'<br\s*/?>', '\n', console_text, flags=re.IGNORECASE)
@@ -340,6 +439,34 @@ def log(config: dict, text: str, level: int = 2):
     logs = config['bot_settings'].get('logs', 0)
     if logs >= level:
         send_telegram(config, text)
+
+
+def send_cookies_expired(config: dict):
+    owner_id = config['bot_settings'].get('owner_id')
+    if not owner_id:
+        return
+
+    text = (
+        '⚠️ <b>Куки протухли или сайт недоступен!</b>\n\n'
+        '1. Проверь, открывается ли <a href="https://lolz.team/">lolz.team</a>\n'
+        '2. Если сайт лежит — подожди и нажми <b>🔄 Перепроверить</b>\n'
+        '3. Если куки реально протухли — обнови их в .env и сделай '
+        '<code>docker compose restart</code>'
+    )
+
+    print(re.sub(r'<[^>]+>', '', text), flush=True)
+
+    tg_api(config, 'sendMessage', {
+        'chat_id': owner_id,
+        'text': text,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+        'reply_markup': {
+            'keyboard': [[{'text': '🔄 Перепроверить'}]],
+            'resize_keyboard': True,
+            'is_persistent': True,
+        },
+    })
 
 
 # =========================
@@ -380,6 +507,8 @@ def bump_thread(session: curl_requests.Session, config: dict,
         )
     except Exception as e:
         return False, f'network error: {e}'
+
+    dump_set_cookie(r, config, f'bump:{thread_id}')
 
     try:
         data = r.json()
@@ -465,6 +594,7 @@ def thread_link(thread_id: str) -> str:
 HELP_TEXT = (
     '<b>🤖 Lolz Bumper — команды</b>\n\n'
     '<b>/status</b> — текущее состояние: темы, последний bump, следующий цикл\n'
+    '<b>/recheck</b> — выйти из режима «остановлен» и перепроверить куки\n'
     '<b>/help</b> — это сообщение\n'
 )
 
@@ -494,9 +624,15 @@ def handle_status(config: dict, chat_id: int):
     lines.append('')
 
     if stopped:
-        lines.append('<b>Состояние:</b> ⛔ остановлен (куки протухли)')
-        lines.append('<i>Обнови .env и сделай docker compose restart</i>')
+        lines.append('<b>Состояние:</b> ⛔ остановлен (куки / сайт недоступен)')
+        lines.append('<i>Нажми «🔄 Перепроверить» или отправь /recheck</i>')
     else:
+        working = bool(threads) and next_cycle is not None
+        if working:
+            lines.append('<b>Состояние:</b> ✅ работает')
+        else:
+            lines.append('<b>Состояние:</b> ⏳ инициализация / нет данных')
+
         lines.append(f'<b>Куки:</b> {"✅ валидны" if cookies_ok else "❌ протухли"}')
         lines.append(f'<b>Последний bump:</b> {fmt_dt(last_bump)}')
         lines.append(f'<b>Следующий цикл:</b> {fmt_dt(next_cycle)}')
@@ -517,6 +653,20 @@ def handle_help(config: dict, chat_id: int):
         print(f'[!] handle_help: chat_id={chat_id} не владелец', flush=True)
         return
     send_telegram_to(config, chat_id, HELP_TEXT)
+
+
+def handle_recheck(config: dict, chat_id: int):
+    if not is_owner(config, chat_id):
+        print(f'[!] handle_recheck: chat_id={chat_id} не владелец', flush=True)
+        return
+
+    with STATE_LOCK:
+        STATE['stopped'] = False
+        STATE['recheck_pending'] = True
+        STATE['next_cycle'] = None
+
+    WAKE_EVENT.set()
+    send_telegram_to(config, chat_id, '🔄 Перепроверяю куки и возобновляю работу...')
 
 
 # =========================
@@ -568,7 +718,6 @@ def telegram_polling(config: dict):
 
                 chat_id = msg['chat']['id']
 
-                # 🔒 ГЛАВНАЯ ПРОВЕРКА: игнорируем всех, кроме владельца
                 if chat_id != owner_id:
                     print(f'[!] Игнорирую сообщение от chat_id={chat_id} '
                           f'(username={msg["chat"].get("username")})', flush=True)
@@ -577,17 +726,11 @@ def telegram_polling(config: dict):
                 text = (msg.get('text') or '').strip()
 
                 if text in ('/start', '/help'):
-                    threading.Thread(
-                        target=handle_help,
-                        args=(config, chat_id),
-                        daemon=True,
-                    ).start()
+                    threading.Thread(target=handle_help, args=(config, chat_id), daemon=True).start()
                 elif text == '/status':
-                    threading.Thread(
-                        target=handle_status,
-                        args=(config, chat_id),
-                        daemon=True,
-                    ).start()
+                    threading.Thread(target=handle_status, args=(config, chat_id), daemon=True).start()
+                elif text in ('/recheck', '/retry', '/check', '🔄 Перепроверить'):
+                    threading.Thread(target=handle_recheck, args=(config, chat_id), daemon=True).start()
         except Exception as e:
             print(f'[!] Polling error: {e}', flush=True)
             time.sleep(5)
@@ -597,16 +740,50 @@ def telegram_polling(config: dict):
 # ПРОВЕРКА КУК
 # =========================
 
-def check_cookies(session: curl_requests.Session) -> bool:
+def check_cookies(session: curl_requests.Session, config: dict) -> bool:
+    """
+    Проверка авторизации через /account/.
+    - 200 — залогинены
+    - 302 -> /login/ — гость
+    - xf_user нет в jar — сервер убил куку
+    """
+    # 1) xf_user вообще есть в jar?
+    try:
+        xf_user = session.cookies.get('xf_user', domain='lolz.team')
+    except Exception:
+        xf_user = None
+
+    if not xf_user:
+        log(config, '[check] xf_user отсутствует в jar', level=2)
+        return False
+
+    # 2) Стучимся в /account/ — гостя редиректит на /login/
     try:
         r = session.get(
-            'https://lolz.team/?tab=mythreads',
+            'https://lolz.team/account/',
             impersonate='firefox',
             timeout=30,
+            allow_redirects=False,
         )
-    except Exception:
+    except Exception as e:
+        log(config, f'[check] /account/ exception: {e}', level=2)
         return False
-    return bool(XF_TOKEN_PATTERN.search(r.text))
+
+    dump_set_cookie(r, config, 'check')
+    log(config, f'[check] /account/ status={r.status_code}', level=2)
+
+    if r.status_code == 200:
+        return True
+
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get('location', '') or r.headers.get('Location', '')
+        log(config, f'[check] /account/ -> {loc}', level=2)
+        if '/login' in loc.lower():
+            return False
+        # Редирект не на логин — считаем, что залогинены (например на /account/ с параметрами)
+        return True
+
+    return False
 
 
 # =========================
@@ -628,74 +805,71 @@ def main():
     log(config, f'[*] Загружено тем: {len(thread_ids)}', level=2)
 
     session = curl_requests.Session()
+    # Ставим только долгоживущие куки. xf_session сервер выдаст сам через Set-Cookie.
+    # ВАЖНО: XF_USER должен быть URL-encoded (%2C вместо запятой).
     session.cookies.set('xf_user', config['cookies']['xf_user'], domain='lolz.team')
     session.cookies.set('xf_tfa_trust_9350116', config['cookies']['xf_tfa_trust'], domain='lolz.team')
-    if config['cookies'].get('xf_session'):
-        session.cookies.set('xf_session', config['cookies']['xf_session'], domain='lolz.team')
     if config['cookies'].get('xf_csrf'):
         session.cookies.set('xf_csrf', config['cookies']['xf_csrf'], domain='lolz.team')
 
+    dump_session_cookies(session, config, 'init')
+
     refresh_x(session, config)
+    warm_up(session, config)
 
-    # Polling запускаем ДО проверки кук — чтобы /status и /help работали даже при мёртвых куках
-    threading.Thread(
-        target=telegram_polling,
-        args=(config,),
-        daemon=True,
-    ).start()
-
-    if not check_cookies(session):
-        with STATE_LOCK:
-            STATE['cookies_ok'] = False
-            STATE['stopped'] = True
-            STATE['started_at'] = datetime.now(timezone.utc)
-        log(config,
-            '⚠️ <b>Куки невалидны при старте!</b>\n'
-            'Проверь XF_USER, XF_TFA_TRUST, XF_SESSION, XF_CSRF в .env.\n'
-            'Останавливаюсь. Жду перезапуска.',
-            level=1)
-        wait_forever()
+    threading.Thread(target=telegram_polling, args=(config,), daemon=True).start()
 
     with STATE_LOCK:
-        STATE['cookies_ok'] = True
         STATE['started_at'] = datetime.now(timezone.utc)
 
-    # Загрузка названий тем
-    for tid in thread_ids:
-        title = fetch_thread_title(session, config, tid)
-        with STATE_LOCK:
-            STATE['threads'][tid] = {
-                'title': title,
-                'url': f'https://lolz.team/threads/{tid}/',
-            }
-        log(config, f'[*] Тема {tid}: {title}', level=2)
+    threads_loaded = False
 
     while True:
-        with STATE_LOCK:
-            if STATE['stopped']:
-                time.sleep(3600)
-                continue
+        wait_for_recheck()
 
-        xf_token = get_xf_token(session, config)
-        if not xf_token:
-            log(config, '[!] Не удалось получить _xfToken, пропускаю цикл', level=2)
+        with STATE_LOCK:
+            STATE['recheck_pending'] = False
+
+        if not check_cookies(session, config):
+            log(config, '[*] Куки невалидны, пробую обновить __x и прогреть сессию...', level=2)
+            refresh_x(session, config)
+            warm_up(session, config)
+
+        if not check_cookies(session, config):
             with STATE_LOCK:
                 STATE['cookies_ok'] = False
                 STATE['stopped'] = True
-            log(config,
-                '⚠️ <b>Куки протухли!</b>\n'
-                'Обнови XF_USER, XF_TFA_TRUST, XF_SESSION, XF_CSRF в .env '
-                'и сделай docker compose restart.\n'
-                'Останавливаюсь. Жду перезапуска.',
-                level=1)
-            wait_forever()
+                STATE['next_cycle'] = None
+            send_cookies_expired(config)
+            continue
 
         with STATE_LOCK:
             STATE['cookies_ok'] = True
+            STATE['stopped'] = False
+
+        if not threads_loaded:
+            for tid in thread_ids:
+                title = fetch_thread_title(session, config, tid)
+                with STATE_LOCK:
+                    STATE['threads'][tid] = {
+                        'title': title,
+                        'url': f'https://lolz.team/threads/{tid}/',
+                    }
+                log(config, f'[*] Тема {tid}: {title}', level=2)
+            threads_loaded = True
+
+        xf_token = get_xf_token(session, config)
+        if not xf_token:
+            with STATE_LOCK:
+                STATE['cookies_ok'] = False
+                STATE['stopped'] = True
+                STATE['next_cycle'] = None
+            send_cookies_expired(config)
+            continue
 
         random.shuffle(thread_ids)
-
         wait_seconds = None
+        auth_fail = False
 
         for thread_id in thread_ids:
             ok, msg = bump_thread(session, config, thread_id, xf_token)
@@ -734,20 +908,21 @@ def main():
                 if 'нарушение безопасности' in lower:
                     log(config, '[*] Похоже, __x протух — обновляю', level=2)
                     refresh_x(session, config)
+                    warm_up(session, config)
                 elif any(marker in lower for marker in AUTH_ERROR_MARKERS):
-                    with STATE_LOCK:
-                        STATE['cookies_ok'] = False
-                        STATE['stopped'] = True
-                    log(config,
-                        '⚠️ <b>Куки протухли!</b>\n'
-                        'Обнови XF_USER, XF_TFA_TRUST, XF_SESSION, XF_CSRF в .env '
-                        'и сделай docker compose restart.\n'
-                        'Останавливаюсь. Жду перезапуска.',
-                        level=1)
-                    wait_forever()
+                    auth_fail = True
+                    break
 
             if len(thread_ids) > 1:
-                time.sleep(jittered(thread_timeout, 15))
+                interruptible_sleep(jittered(thread_timeout, 15))
+
+        if auth_fail:
+            with STATE_LOCK:
+                STATE['cookies_ok'] = False
+                STATE['stopped'] = True
+                STATE['next_cycle'] = None
+            send_cookies_expired(config)
+            continue
 
         if wait_seconds is not None:
             extra = random.uniform(30, max(30, jitter_seconds))
@@ -766,7 +941,9 @@ def main():
             f'[*] Сплю {fmt_duration(sleep_for)} до следующего цикла ({source})',
             level=2,
         )
-        time.sleep(sleep_for)
+
+        if interruptible_sleep(sleep_for):
+            log(config, '[*] Сон прерван (/recheck), начинаю новый цикл', level=2)
 
 
 if __name__ == '__main__':
