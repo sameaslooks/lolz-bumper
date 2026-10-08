@@ -52,7 +52,12 @@ def get_config() -> dict:
 
     token = req('TG_TOKEN')
 
+    lang = (opt('LANG', 'en') or 'en').lower()
+    if lang not in ('en', 'ru'):
+        lang = 'en'
+
     return {
+        'lang': lang,
         'cookies': {
             'xf_user': req('XF_USER'),
             'xf_tfa_trust': req('XF_TFA_TRUST'),
@@ -71,6 +76,96 @@ def get_config() -> dict:
             'thread_urls': thread_urls,
         },
     }
+
+
+# =========================
+# ЛОКАЛИЗАЦИЯ
+# =========================
+
+STRINGS = {
+    'en': {
+        'help': (
+            '<b>🤖 Lolz Bumper — commands</b>\n\n'
+            '<b>/status</b> — current state: threads, last bump, next cycle\n'
+            '<b>/recheck</b> — exit stopped mode and recheck cookies\n'
+            '<b>/help</b> — this message\n'
+        ),
+        'status_header': '<b>📊 Lolz Bumper Status</b>\n',
+        'status_threads_label': '<b>Threads:</b>',
+        'status_no_threads': '<b>Threads:</b> not loaded',
+        'status_stopped': '<b>State:</b> ⛔ stopped (cookies / site unavailable)',
+        'status_stopped_hint': '<i>Tap 🔄 Recheck or send /recheck</i>',
+        'status_running': '<b>State:</b> ✅ running',
+        'status_init': '<b>State:</b> ⏳ initializing / no data',
+        'status_cookies': '<b>Cookies:</b> {state}',
+        'status_cookies_ok': '✅ valid',
+        'status_cookies_bad': '❌ expired',
+        'status_last_bump': '<b>Last bump:</b> {dt}',
+        'status_next_cycle': '<b>Next cycle:</b> {dt}',
+        'status_time_left': '<b>Time left:</b> {dur}',
+        'status_started': '\n<b>Started:</b> {dt}',
+        'cookies_expired': (
+            '⚠️ <b>Cookies expired or site unavailable!</b>\n\n'
+            '1. Check if <a href="https://lolz.team/">lolz.team</a> is up\n'
+            '2. If the site is down — wait and tap <b>🔄 Recheck</b>\n'
+            '3. If cookies are truly expired — update them in .env and run '
+            '<code>docker compose restart</code>'
+        ),
+        'recheck_btn': '🔄 Recheck',
+        'recheck_started': '🔄 Rechecking cookies and resuming...',
+        'bump_ok': '<b>✅ Thread bumped</b>\n\n📌 {title}\n🔗 {link}\n🕐 {dt}',
+        'bump_fail': '<b>⚠️ Failed to bump</b>\n\n📌 {title}\n🔗 {link}\n📝 {msg}',
+        'thread_fallback': 'Thread {id}',
+        'dur_h': '{n:.2f} h',
+        'dur_m': '{n:.1f} min',
+        'dur_s': '{n} sec',
+    },
+    'ru': {
+        'help': (
+            '<b>🤖 Lolz Bumper — команды</b>\n\n'
+            '<b>/status</b> — текущее состояние: темы, последний bump, следующий цикл\n'
+            '<b>/recheck</b> — выйти из режима «остановлен» и перепроверить куки\n'
+            '<b>/help</b> — это сообщение\n'
+        ),
+        'status_header': '<b>📊 Статус Lolz Bumper</b>\n',
+        'status_threads_label': '<b>Темы:</b>',
+        'status_no_threads': '<b>Темы:</b> не загружены',
+        'status_stopped': '<b>Состояние:</b> ⛔ остановлен (куки / сайт недоступен)',
+        'status_stopped_hint': '<i>Нажми «🔄 Перепроверить» или отправь /recheck</i>',
+        'status_running': '<b>Состояние:</b> ✅ работает',
+        'status_init': '<b>Состояние:</b> ⏳ инициализация / нет данных',
+        'status_cookies': '<b>Куки:</b> {state}',
+        'status_cookies_ok': '✅ валидны',
+        'status_cookies_bad': '❌ протухли',
+        'status_last_bump': '<b>Последний bump:</b> {dt}',
+        'status_next_cycle': '<b>Следующий цикл:</b> {dt}',
+        'status_time_left': '<b>Осталось:</b> {dur}',
+        'status_started': '\n<b>Запущен:</b> {dt}',
+        'cookies_expired': (
+            '⚠️ <b>Куки протухли или сайт недоступен!</b>\n\n'
+            '1. Проверь, открывается ли <a href="https://lolz.team/">lolz.team</a>\n'
+            '2. Если сайт лежит — подожди и нажми <b>🔄 Перепроверить</b>\n'
+            '3. Если куки реально протухли — обнови их в .env и сделай '
+            '<code>docker compose restart</code>'
+        ),
+        'recheck_btn': '🔄 Перепроверить',
+        'recheck_started': '🔄 Перепроверяю куки и возобновляю работу...',
+        'bump_ok': '<b>✅ Тема поднята</b>\n\n📌 {title}\n🔗 {link}\n🕐 {dt}',
+        'bump_fail': '<b>⚠️ Не удалось поднять</b>\n\n📌 {title}\n🔗 {link}\n📝 {msg}',
+        'thread_fallback': 'Тема {id}',
+        'dur_h': '{n:.2f} ч',
+        'dur_m': '{n:.1f} мин',
+        'dur_s': '{n} сек',
+    },
+}
+
+
+def t(key: str, config: dict, **kwargs) -> str:
+    lang = config.get('lang', 'en')
+    s = STRINGS.get(lang, STRINGS['en']).get(key) or STRINGS['en'].get(key, key)
+    if kwargs:
+        return s.format(**kwargs)
+    return s
 
 
 # =========================
@@ -307,7 +402,7 @@ def fetch_thread_title(session: curl_requests.Session, config: dict,
     try:
         r = session.get(url, impersonate='firefox', timeout=30)
     except Exception:
-        return f'Тема {thread_id}'
+        return t('thread_fallback', config, id=thread_id)
 
     dump_set_cookie(r, config, f'title:{thread_id}')
     log(config, f'[title:{thread_id}] status={r.status_code} len={len(r.text)}', level=2)
@@ -319,7 +414,7 @@ def fetch_thread_title(session: curl_requests.Session, config: dict,
             r = session.get(url, impersonate='firefox', timeout=30)
             dump_set_cookie(r, config, f'title:{thread_id}:retry')
         except Exception:
-            return f'Тема {thread_id}'
+            return t('thread_fallback', config, id=thread_id)
 
     for pattern in (H1_TITLE_PATTERN, H1_TITLE_FALLBACK, TITLE_TAG_PATTERN):
         m = pattern.search(r.text)
@@ -328,7 +423,7 @@ def fetch_thread_title(session: curl_requests.Session, config: dict,
             if not _is_bad_title(title):
                 return title
 
-    return f'Тема {thread_id}'
+    return t('thread_fallback', config, id=thread_id)
 
 
 # =========================
@@ -446,14 +541,7 @@ def send_cookies_expired(config: dict):
     if not owner_id:
         return
 
-    text = (
-        '⚠️ <b>Куки протухли или сайт недоступен!</b>\n\n'
-        '1. Проверь, открывается ли <a href="https://lolz.team/">lolz.team</a>\n'
-        '2. Если сайт лежит — подожди и нажми <b>🔄 Перепроверить</b>\n'
-        '3. Если куки реально протухли — обнови их в .env и сделай '
-        '<code>docker compose restart</code>'
-    )
-
+    text = t('cookies_expired', config)
     print(re.sub(r'<[^>]+>', '', text), flush=True)
 
     tg_api(config, 'sendMessage', {
@@ -462,7 +550,7 @@ def send_cookies_expired(config: dict):
         'parse_mode': 'HTML',
         'disable_web_page_preview': True,
         'reply_markup': {
-            'keyboard': [[{'text': '🔄 Перепроверить'}]],
+            'keyboard': [[{'text': t('recheck_btn', config)}]],
             'resize_keyboard': True,
             'is_persistent': True,
         },
@@ -563,19 +651,19 @@ def fmt_dt(dt: datetime | None) -> str:
     return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
 
 
-def fmt_duration(seconds: float) -> str:
+def fmt_duration(seconds: float, config: dict) -> str:
     if seconds >= 3600:
-        return f'{seconds/3600:.2f} ч'
+        return t('dur_h', config, n=seconds / 3600)
     if seconds >= 60:
-        return f'{seconds/60:.1f} мин'
-    return f'{int(seconds)} сек'
+        return t('dur_m', config, n=seconds / 60)
+    return t('dur_s', config, n=int(seconds))
 
 
-def thread_label(thread_id: str) -> str:
+def thread_label(thread_id: str, config: dict) -> str:
     with STATE_LOCK:
         info = STATE['threads'].get(thread_id)
     if not info:
-        return f'Тема {thread_id}'
+        return t('thread_fallback', config, id=thread_id)
     return info['title']
 
 
@@ -591,14 +679,6 @@ def thread_link(thread_id: str) -> str:
 # КОМАНДЫ БОТА
 # =========================
 
-HELP_TEXT = (
-    '<b>🤖 Lolz Bumper — команды</b>\n\n'
-    '<b>/status</b> — текущее состояние: темы, последний bump, следующий цикл\n'
-    '<b>/recheck</b> — выйти из режима «остановлен» и перепроверить куки\n'
-    '<b>/help</b> — это сообщение\n'
-)
-
-
 def handle_status(config: dict, chat_id: int):
     if not is_owner(config, chat_id):
         print(f'[!] handle_status: chat_id={chat_id} не владелец', flush=True)
@@ -612,38 +692,39 @@ def handle_status(config: dict, chat_id: int):
         started_at = STATE['started_at']
         stopped = STATE['stopped']
 
-    lines = ['<b>📊 Статус Lolz Bumper</b>\n']
+    lines = [t('status_header', config)]
 
     if threads:
-        lines.append('<b>Темы:</b>')
+        lines.append(t('status_threads_label', config))
         for tid, info in threads.items():
             lines.append(f'• <a href="{info["url"]}">{info["title"]}</a>')
     else:
-        lines.append('<b>Темы:</b> не загружены')
+        lines.append(t('status_no_threads', config))
 
     lines.append('')
 
     if stopped:
-        lines.append('<b>Состояние:</b> ⛔ остановлен (куки / сайт недоступен)')
-        lines.append('<i>Нажми «🔄 Перепроверить» или отправь /recheck</i>')
+        lines.append(t('status_stopped', config))
+        lines.append(t('status_stopped_hint', config))
     else:
         working = bool(threads) and next_cycle is not None
         if working:
-            lines.append('<b>Состояние:</b> ✅ работает')
+            lines.append(t('status_running', config))
         else:
-            lines.append('<b>Состояние:</b> ⏳ инициализация / нет данных')
+            lines.append(t('status_init', config))
 
-        lines.append(f'<b>Куки:</b> {"✅ валидны" if cookies_ok else "❌ протухли"}')
-        lines.append(f'<b>Последний bump:</b> {fmt_dt(last_bump)}')
-        lines.append(f'<b>Следующий цикл:</b> {fmt_dt(next_cycle)}')
+        cookie_state = t('status_cookies_ok', config) if cookies_ok else t('status_cookies_bad', config)
+        lines.append(t('status_cookies', config, state=cookie_state))
+        lines.append(t('status_last_bump', config, dt=fmt_dt(last_bump)))
+        lines.append(t('status_next_cycle', config, dt=fmt_dt(next_cycle)))
 
         if next_cycle:
             now = datetime.now(timezone.utc)
             left = (next_cycle - now).total_seconds()
             if left > 0:
-                lines.append(f'<b>Осталось:</b> {fmt_duration(left)}')
+                lines.append(t('status_time_left', config, dur=fmt_duration(left, config)))
 
-    lines.append(f'\n<b>Запущен:</b> {fmt_dt(started_at)}')
+    lines.append(t('status_started', config, dt=fmt_dt(started_at)))
 
     send_telegram_to(config, chat_id, '\n'.join(lines))
 
@@ -652,7 +733,7 @@ def handle_help(config: dict, chat_id: int):
     if not is_owner(config, chat_id):
         print(f'[!] handle_help: chat_id={chat_id} не владелец', flush=True)
         return
-    send_telegram_to(config, chat_id, HELP_TEXT)
+    send_telegram_to(config, chat_id, t('help', config))
 
 
 def handle_recheck(config: dict, chat_id: int):
@@ -666,7 +747,7 @@ def handle_recheck(config: dict, chat_id: int):
         STATE['next_cycle'] = None
 
     WAKE_EVENT.set()
-    send_telegram_to(config, chat_id, '🔄 Перепроверяю куки и возобновляю работу...')
+    send_telegram_to(config, chat_id, t('recheck_started', config))
 
 
 # =========================
@@ -693,6 +774,8 @@ def telegram_polling(config: dict):
             print(f'[*] Polling: пропускаю старые апдейты, offset={offset}', flush=True)
     except Exception as e:
         print(f'[!] Polling init error: {e}', flush=True)
+
+    recheck_triggers = {'/recheck', '/retry', '/check', '🔄 Перепроверить', '🔄 Recheck'}
 
     while True:
         try:
@@ -729,7 +812,7 @@ def telegram_polling(config: dict):
                     threading.Thread(target=handle_help, args=(config, chat_id), daemon=True).start()
                 elif text == '/status':
                     threading.Thread(target=handle_status, args=(config, chat_id), daemon=True).start()
-                elif text in ('/recheck', '/retry', '/check', '🔄 Перепроверить'):
+                elif text in recheck_triggers:
                     threading.Thread(target=handle_recheck, args=(config, chat_id), daemon=True).start()
         except Exception as e:
             print(f'[!] Polling error: {e}', flush=True)
@@ -873,31 +956,17 @@ def main():
 
         for thread_id in thread_ids:
             ok, msg = bump_thread(session, config, thread_id, xf_token)
-            title = thread_label(thread_id)
+            title = thread_label(thread_id, config)
             link = thread_link(thread_id)
 
             if ok:
                 now = datetime.now(timezone.utc)
                 with STATE_LOCK:
                     STATE['last_bump'] = now
-                log(
-                    config,
-                    f'<b>✅ Тема поднята</b>\n\n'
-                    f'📌 {title}\n'
-                    f'🔗 {link}\n'
-                    f'🕐 {fmt_dt(now)}',
-                    level=1,
-                )
+                log(config, t('bump_ok', config, title=title, link=link, dt=fmt_dt(now)), level=1)
             else:
                 short_msg = msg.replace('\n', ' ').strip()
-                log(
-                    config,
-                    f'<b>⚠️ Не удалось поднять</b>\n\n'
-                    f'📌 {title}\n'
-                    f'🔗 {link}\n'
-                    f'📝 {short_msg}',
-                    level=1,
-                )
+                log(config, t('bump_fail', config, title=title, link=link, msg=short_msg), level=1)
 
                 w = parse_wait_seconds(msg)
                 if w is not None:
@@ -927,7 +996,7 @@ def main():
         if wait_seconds is not None:
             extra = random.uniform(30, max(30, jitter_seconds))
             sleep_for = wait_seconds + extra
-            source = f'форум сказал ждать {fmt_duration(wait_seconds)} (+{int(extra)} сек)'
+            source = f'forum timer {fmt_duration(wait_seconds, config)} +{int(extra)}s'
         else:
             sleep_for = jittered(base_interval, jitter_seconds)
             source = 'TIMEOUT + jitter'
@@ -938,12 +1007,12 @@ def main():
 
         log(
             config,
-            f'[*] Сплю {fmt_duration(sleep_for)} до следующего цикла ({source})',
+            f'[*] Sleeping {fmt_duration(sleep_for, config)} until next cycle ({source})',
             level=2,
         )
 
         if interruptible_sleep(sleep_for):
-            log(config, '[*] Сон прерван (/recheck), начинаю новый цикл', level=2)
+            log(config, '[*] Sleep interrupted (/recheck), starting new cycle', level=2)
 
 
 if __name__ == '__main__':
